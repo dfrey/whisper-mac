@@ -19,6 +19,9 @@ export class DictationFlowManager {
   private finishingTimeout: NodeJS.Timeout | null = null;
   private eventCleanupFns: Array<() => void> = [];
   private soundService: SoundService | null = null;
+  private processingError: unknown = null;
+  private processingGeneration = 0;
+  private preparing = false;
   private activeProcessingTasks = 0;
   private processingWaiters: Array<() => void> = [];
 
@@ -83,6 +86,13 @@ export class DictationFlowManager {
       }
     };
 
+    const onWarmupChanged = ({ plugin, warmingUp }: { plugin: string; warmingUp: boolean }) => {
+      if (plugin === this.transcriptionPluginManager.getActivePluginName()) {
+        this.dictationWindowService.setWarmupMessage(this.state === "recording" && warmingUp, this.getWarmupModelLabel());
+      }
+    };
+    this.transcriptionPluginManager.on("plugin-warmup-changed", onWarmupChanged);
+    this.eventCleanupFns.push(() => this.transcriptionPluginManager.off("plugin-warmup-changed", onWarmupChanged));
     this.audioCaptureService.on("vad-segment", onVadSegment);
     this.audioCaptureService.on("chunk-ready", onChunkReady);
     this.audioCaptureService.on("audio-level", onAudioLevel);
@@ -103,6 +113,7 @@ export class DictationFlowManager {
   private async handleChunkReady(event: ChunkReadyEvent): Promise<void> {
     if (this.state !== "recording" && this.state !== "finishing") return;
 
+    const sessionId = this.currentSessionId;
     await this.runTrackedProcessing(async () => {
       try {
         console.log(
@@ -110,6 +121,7 @@ export class DictationFlowManager {
         );
         await this.transcriptionPluginManager.processAudioSegment(event.audio);
 
+        if (sessionId !== this.currentSessionId) return;
         const waitSucceeded = await this.waitForCompletedSegmentsStateOnly(
           DICTATION_CONFIG.SEGMENT_COMPLETION_TIMEOUT_MS,
         );
@@ -119,6 +131,7 @@ export class DictationFlowManager {
           );
         }
 
+        if (sessionId !== this.currentSessionId) return;
         const completedSegments =
           this.segmentManager.getCompletedTranscribedSegments();
         if (completedSegments.length > 0) {
@@ -135,6 +148,7 @@ export class DictationFlowManager {
           this.segmentManager.clearCompletedSegmentsOnly();
         }
       } catch (error) {
+        if (sessionId === this.currentSessionId) this.processingError = error;
         console.error("[DictationFlowManager] Failed to process chunk:", error);
       }
     });
@@ -156,6 +170,13 @@ export class DictationFlowManager {
     const currentTimeout = this.finishingTimeout;
     this.finishingTimeout = timeout;
     return currentTimeout;
+  }
+
+  private getWarmupModelLabel(): string {
+    const plugin = this.transcriptionPluginManager.getActivePlugin();
+    const model = plugin?.getOptions().model;
+    return plugin?.getSchema().find((item) => item.key === "model")?.options
+      ?.find((option) => option.value === model)?.label || model || plugin?.displayName || "Whisper";
   }
 
   async startDictation(): Promise<void> {
@@ -185,10 +206,15 @@ export class DictationFlowManager {
         !!criteria?.runOnAll ||
         this.transcriptionPluginManager.willBufferNextSession();
 
-      // Start recording immediately
-      await this.startRecording();
-
+      const plugin = this.transcriptionPluginManager.getActivePlugin();
+      this.preparing = plugin?.isWarmingUp() ?? false;
+      this.dictationWindowService.setWarmupMessage(this.preparing, this.getWarmupModelLabel());
       await this.dictationWindowService.showDictationWindow(runOnAllSession);
+      if (this.preparing) await plugin?.waitForWarmup();
+      if (sessionId !== this.currentSessionId) return;
+      this.preparing = false;
+      this.dictationWindowService.setWarmupMessage(false);
+      await this.startRecording();
       const windowEndTime = Date.now();
       console.log(`Window display: ${windowEndTime - windowStartTime}ms`);
       promiseManager.resolve(`dictation:window:show:${sessionId}`);
@@ -198,6 +224,8 @@ export class DictationFlowManager {
       const totalTime = Date.now() - startTime;
       console.log(`=== Dictation started successfully in ${totalTime}ms ===`);
     } catch (error) {
+      if (sessionId !== this.currentSessionId) return;
+      this.preparing = false;
       console.error("Failed to start dictation:", error);
       promiseManager.reject(`dictation:init:${sessionId}`, error);
       await this.cancelDictationFlow();
@@ -222,8 +250,10 @@ export class DictationFlowManager {
   async finishCurrentDictation(
     options: { skipTransformation?: boolean } = {},
   ): Promise<void> {
+    if (this.preparing) return;
     if (this.state !== "recording") return;
 
+    const sessionId = this.currentSessionId;
     try {
       appStore.setDictationState("finishing");
 
@@ -283,7 +313,12 @@ export class DictationFlowManager {
         await audioStopWait;
       }
 
-      const processingSettled = await this.waitForPendingProcessingTasks(8000);
+      const processingSettled = await this.waitForPendingProcessingTasks(
+        this.transcriptionPluginManager.getActivePluginName() === "whisper-cpp" ? 185000 : 8000,
+      );
+      if (sessionId !== this.currentSessionId) return;
+      if (!processingSettled) throw new Error("Transcription timed out. Try again or select a smaller model.");
+      if (this.processingError) throw this.processingError;
       console.log("[DictationFlowManager] Pending processing settled:", {
         processingSettled,
         activeProcessingTasks: this.activeProcessingTasks,
@@ -332,12 +367,16 @@ export class DictationFlowManager {
         try {
           await this.transcriptionPluginManager.finalizeBufferedAudio();
         } catch (e) {
-          console.error("Failed to finalize buffered audio:", e);
+          throw e;
         }
       }
 
       // Wait briefly for any in-flight transcription to complete so we don't inject placeholders
       const waitSucceeded = await this.waitForCompletedSegments(8000);
+      if (sessionId !== this.currentSessionId) return;
+      if (!waitSucceeded && this.segmentManager.getInProgressTranscribedSegments().length > 0) {
+        throw new Error("Transcription did not complete. Try again or select a smaller model.");
+      }
       console.log("Wait for completed segments:", waitSucceeded);
 
       console.log(
@@ -351,6 +390,7 @@ export class DictationFlowManager {
           onInjecting: () => this.dictationWindowService.setStatus("injecting"),
         });
 
+      if (sessionId !== this.currentSessionId) return;
       if (transformResult.success) {
         console.log(
           `Successfully transformed and injected ${transformResult.segmentsProcessed} segments`,
@@ -375,12 +415,14 @@ export class DictationFlowManager {
       if (this.currentSessionId) {
         promiseManager.start(`dictation:window:hide:${this.currentSessionId}`);
         await new Promise((resolve) => setTimeout(resolve, 500));
+        if (sessionId !== this.currentSessionId) return;
         this.dictationWindowService.hideWindow();
         promiseManager.resolve(
           `dictation:window:hide:${this.currentSessionId}`,
         );
       } else {
         await new Promise((resolve) => setTimeout(resolve, 500));
+        if (sessionId !== this.currentSessionId) return;
         this.dictationWindowService.hideWindow();
       }
 
@@ -395,11 +437,17 @@ export class DictationFlowManager {
       }
       console.log("=== Dictation completed and cleaned up successfully ===");
     } catch (error) {
+      if (sessionId !== this.currentSessionId) return;
       console.error("Failed to finish current dictation:", error);
       await this.cancelDictationFlow();
+      await this.errorManager.showError({
+        title: "Transcription failed",
+        description: error instanceof Error ? error.message : String(error),
+        actions: ["ok"],
+      });
     } finally {
-      this.clearFinishingTimeout();
-      if (appStore.select((s) => s.dictation.state) === "finishing") {
+      if (sessionId === this.currentSessionId) this.clearFinishingTimeout();
+      if (sessionId === this.currentSessionId && appStore.select((s) => s.dictation.state) === "finishing") {
         appStore.setDictationState("idle", null);
       }
     }
@@ -581,10 +629,22 @@ export class DictationFlowManager {
 
   async cancelDictationFlow(): Promise<void> {
     console.log("=== Cancelling dictation flow ===");
+    this.dictationWindowService.setWarmupMessage(false);
 
     this.clearFinishingTimeout();
     const wasRecording = this.state !== "idle";
     const sessionId = this.currentSessionId;
+
+    if (this.preparing) {
+      // Invalidate the pending start, but keep model selection disabled until
+      // the warm-up process has actually closed.
+      appStore.setDictationState("finishing", null);
+      await this.transcriptionPluginManager.stopTranscription();
+      try {
+        await this.transcriptionPluginManager.getActivePlugin()?.waitForWarmup();
+      } catch { /* A failed warm-up is already being canceled. */ }
+      this.preparing = false;
+    }
 
     appStore.setState({
       dictation: {
@@ -595,6 +655,7 @@ export class DictationFlowManager {
       },
     });
     this.updateTrayIcon("idle");
+    this.resetProcessingTasks();
 
     if (sessionId) {
       promiseManager.cancel(`dictation:init:${sessionId}`);
@@ -618,8 +679,10 @@ export class DictationFlowManager {
   }
 
   private clearState(): void {
+    this.resetProcessingTasks();
     this.segmentManager.clearAllSegments();
     this.segmentManager.resetIgnoreNextCompleted();
+    this.processingError = null;
   }
 
   private setupAccumulatingMode(): void {
@@ -627,10 +690,12 @@ export class DictationFlowManager {
   }
 
   private async startTranscription(): Promise<void> {
+    const sessionId = this.currentSessionId;
     const transcriptionStartTime = Date.now();
     try {
       await this.transcriptionPluginManager.startTranscription(
         async (update: SegmentUpdate) => {
+          if (sessionId !== this.currentSessionId) return;
           this.dictationWindowService.updateTranscription(update);
           await this.processSegments(update);
         },
@@ -666,15 +731,17 @@ export class DictationFlowManager {
       return;
     }
 
+    const sessionId = this.currentSessionId;
     await this.runTrackedProcessing(async () => {
       try {
         this.dictationWindowService.setStatus("transcribing");
         console.log("Processing VAD audio segment:", audioData.length, "samples");
         await this.transcriptionPluginManager.processAudioSegment(audioData);
       } catch (error) {
+        if (sessionId === this.currentSessionId) this.processingError = error;
         console.error("Error processing audio segment:", error);
       } finally {
-        if (this.state === "recording") {
+        if (sessionId === this.currentSessionId && this.state === "recording") {
           this.dictationWindowService.setStatus("recording");
         }
       }
@@ -739,11 +806,20 @@ export class DictationFlowManager {
     return this.segmentManager.hasInitialSelectedText() || allSegments.length > 0;
   }
 
+  private resetProcessingTasks(): void {
+    this.processingGeneration++;
+    this.activeProcessingTasks = 0;
+    const waiters = this.processingWaiters.splice(0);
+    waiters.forEach((resolve) => resolve());
+  }
+
   private async runTrackedProcessing(task: () => Promise<void>): Promise<void> {
+    const generation = this.processingGeneration;
     this.activeProcessingTasks += 1;
     try {
       await task();
     } finally {
+      if (generation !== this.processingGeneration) return;
       this.activeProcessingTasks = Math.max(0, this.activeProcessingTasks - 1);
       if (this.activeProcessingTasks === 0) {
         const waiters = [...this.processingWaiters];
@@ -823,7 +899,7 @@ export class DictationFlowManager {
         cleanup();
         const finalCompleted =
           this.segmentManager.getCompletedTranscribedSegments();
-        resolve(finalCompleted.length > 0);
+        resolve(finalCompleted.length > 0 && this.segmentManager.getInProgressTranscribedSegments().length === 0);
       }, timeoutMs);
     });
   }

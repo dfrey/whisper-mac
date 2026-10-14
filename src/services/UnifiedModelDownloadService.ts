@@ -183,7 +183,7 @@ export class UnifiedModelDownloadService extends EventEmitter {
     }
 
     const pluginConfig = this.config.getPluginConfig();
-    const pluginOptions = pluginConfig[pluginName] || {};
+    const pluginOptions = { ...(pluginConfig[pluginName] || {}) };
 
     // Use provided model name or get from plugin options
     if (modelName) {

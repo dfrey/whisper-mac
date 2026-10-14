@@ -6,6 +6,7 @@ export default {
     // Reactive state
     const isRecording = ref(false);
     const currentStatus = ref("idle");
+    const warmupMessage = ref("");
     const transcriptionSegments = ref([]);
     const finalText = ref("");
     const currentAudioLevel = ref(0);
@@ -172,6 +173,12 @@ export default {
     };
 
     onMounted(() => {
+      window.electronAPI.onInitializeDictation((data) => {
+        warmupMessage.value = data.warmupMessage || "";
+      });
+      window.electronAPI.onDictationWarmupMessage((message) => {
+        warmupMessage.value = message;
+      });
       // Defer initialization to ensure canvas is mounted (if v-if allows)
       nextTick(() => {
         initialize();
@@ -224,6 +231,7 @@ export default {
       });
 
       window.electronAPI.onWindowHidden(() => {
+        warmupMessage.value = "";
         isVisible.value = false;
         // Clear all segments and reset visualizer when window is hidden
         transcriptionSegments.value = [];
@@ -255,6 +263,7 @@ export default {
     return {
       isRecording,
       currentStatus,
+      warmupMessage,
       displaySegments,
       showVisualizer,
       isTranscribing,

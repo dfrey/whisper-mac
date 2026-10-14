@@ -13,6 +13,7 @@ import { MicrophonePermissionService } from "./MicrophonePermissionService";
 import { LoginItemService } from "./LoginItemService";
 import { HistoryService } from "./HistoryService";
 import { SoundService } from "./SoundService";
+import { appStore } from "../core/AppStore";
 import {
   SettingsExportImportService,
   ImportProgress,
@@ -110,6 +111,15 @@ export class SettingsService {
   }
 
   private setupIpcHandlers(): void {
+    ipcMain.handle("settings:getSessionWhisperModel", () =>
+      this.requirePluginManager().getSessionWhisperModel(),
+    );
+    ipcMain.handle("settings:setSessionWhisperModel", (_event, modelName: string) => {
+      if (this.unifiedModelDownloadService?.isDownloading()) {
+        throw new Error("Wait for the current model download to finish.");
+      }
+      this.requirePluginManager().setSessionWhisperModel(modelName);
+    });
     // Get settings schema
     ipcMain.handle("settings:getSchema", async () => {
       try {
@@ -572,6 +582,12 @@ export class SettingsService {
         }
 
         const { pluginName, modelName } = payload;
+        if (pluginName === "whisper-cpp" && modelName &&
+            (appStore.select((s) => s.dictation.state !== "idle") ||
+             this.unifiedModelDownloadService.isDownloading() ||
+             this.requirePlugin(pluginName).getState().isLoading)) {
+          throw new Error("Wait until dictation, processing, and downloads finish before switching models.");
+        }
 
         const onProgress = (progress: any) => {
           event.sender.send("settings:pluginSwitchProgress", progress);
@@ -590,6 +606,9 @@ export class SettingsService {
           );
 
           // Selection is session-only. settings:save persists the user's draft.
+          if (pluginName === "whisper-cpp" && modelName) {
+            this.requirePluginManager().rememberSessionWhisperModel();
+          }
           return { success: true };
         } catch (error: any) {
           throw new Error(error.message || "Plugin switch failed");
@@ -1387,6 +1406,14 @@ export class SettingsService {
     });
   }
 
+  public broadcastWhisperModelUpdate(modelName: string): void {
+    BrowserWindow.getAllWindows().forEach((window) => {
+      if (!window.isDestroyed()) {
+        window.webContents.send("settings:whisperModelUpdated", modelName);
+      }
+    });
+  }
+
   public broadcastSettingsUpdate(): void {
     const settings = this.settingsManager.getAll();
 
@@ -1541,6 +1568,8 @@ export class SettingsService {
     ipcMain.removeHandler("ai:validateConfiguration");
 
     ipcMain.removeHandler("settings:switchPlugin");
+    ipcMain.removeHandler("settings:getSessionWhisperModel");
+    ipcMain.removeHandler("settings:setSessionWhisperModel");
     ipcMain.removeHandler("settings:testPluginActivation");
     ipcMain.removeHandler("settings:validatePluginApiKey");
     ipcMain.removeHandler("settings:getActivePluginAiCapabilities");

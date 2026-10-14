@@ -11,6 +11,7 @@ import { TranscriptionPluginManager } from "../plugins/TranscriptionPluginManage
 import { NotificationService } from "./NotificationService";
 import { SettingsManager } from "../config/SettingsManager";
 import { appStore, SetupStatus } from "../core/AppStore";
+import { ModelManager } from "./ModelManager";
 
 export { SetupStatus };
 
@@ -18,6 +19,8 @@ export class TrayService {
   private tray: Tray | null = null;
   private trayMenu: Menu | null = null;
   private onOpenRecordingNotes: (() => void) | null = null;
+  private menuRevision = 0;
+  private lastWhisperModelMenuDiagnostic = "";
 
   private get currentStatus(): SetupStatus {
     return appStore.select((s) => s.app.status);
@@ -33,6 +36,9 @@ export class TrayService {
     private readonly pluginManager: TranscriptionPluginManager,
     private readonly notificationService: NotificationService,
     private readonly settingsManager: SettingsManager,
+    private readonly modelManager: ModelManager,
+    private readonly isDownloading: () => boolean,
+    private readonly onManageModels: () => void,
   ) {}
 
   setRecordingNotesCallback(cb: () => void): void {
@@ -47,18 +53,107 @@ export class TrayService {
     this.tray.setIgnoreDoubleClickEvents(true);
     this.tray.on("click", (event) => {
       if (event.ctrlKey || this.currentStatus !== "idle") {
-        try {
-          if (this.trayMenu) this.tray?.popUpContextMenu(this.trayMenu);
-        } catch (e) {}
+        void this.openContextMenu();
         return;
       }
       this.onLeftClick();
     });
     this.tray.on("right-click", () => {
-      try {
-        if (this.trayMenu) this.tray?.popUpContextMenu(this.trayMenu);
-      } catch (e) {}
+      void this.openContextMenu();
     });
+  }
+
+  private async openContextMenu(): Promise<void> {
+    try {
+      await this.refreshTrayMenu();
+      if (this.trayMenu) this.tray?.popUpContextMenu(this.trayMenu);
+    } catch (error) {
+      console.error("Could not open tray menu:", error);
+    }
+  }
+
+  private canSwitchWhisperModel(): boolean {
+    return this.getWhisperModelSwitchBlockers().length === 0;
+  }
+
+  private getWhisperModelSwitchBlockers(): string[] {
+    const plugin = this.pluginManager.getPlugin("whisper-cpp");
+    const state = appStore.select((s) => ({
+      dictation: s.dictation.state,
+      app: s.app.status,
+    }));
+    const blockers: string[] = [];
+
+    if (this.pluginManager.getActivePluginName() !== "whisper-cpp") {
+      blockers.push(`active plugin is ${this.pluginManager.getActivePluginName() ?? "none"}`);
+    }
+    if (state.dictation !== "idle") blockers.push(`dictation state is ${state.dictation}`);
+    if (state.app !== "idle") blockers.push(`app status is ${state.app}`);
+    if (this.isDownloading()) blockers.push("a model download is in progress");
+    if (plugin?.getState().isLoading) blockers.push("Whisper plugin is loading");
+    if (plugin?.isWarmingUp()) blockers.push("Whisper warm-up is in progress");
+
+    return blockers;
+  }
+
+  private logWhisperModelMenuDiagnostic(blockers: string[], notDownloaded: string[]): void {
+    const diagnostic = JSON.stringify({ blockers, notDownloaded });
+    if (!blockers.length && !notDownloaded.length) {
+      this.lastWhisperModelMenuDiagnostic = "";
+      return;
+    }
+    if (diagnostic === this.lastWhisperModelMenuDiagnostic) return;
+
+    console.info(`[Tray] Whisper model choices disabled: ${diagnostic}`);
+    this.lastWhisperModelMenuDiagnostic = diagnostic;
+  }
+
+  private generateWhisperModelSubmenu(): Electron.MenuItemConstructorOptions | null {
+    if (this.pluginManager.getActivePluginName() !== "whisper-cpp") return null;
+    const plugin = this.pluginManager.getPlugin("whisper-cpp")!;
+    const schema = plugin.getSchema().find((item) => item.key === "model");
+    if (!schema) return null;
+    const current = plugin.getOptions().model || schema.default;
+    const models = schema.options || [];
+    const downloaded = new Set(this.modelManager.listDownloadedModels()
+      .filter((model) => model.sizeBytes > 0).map((model) => model.repoId));
+    const visibleModels = models
+      .filter((model) => downloaded.has(model.value) || model.value === current);
+    const blockers = this.getWhisperModelSwitchBlockers();
+    const notDownloaded = visibleModels
+      .filter((model) => !downloaded.has(model.value))
+      .map((model) => model.value);
+    this.logWhisperModelMenuDiagnostic(blockers, notDownloaded);
+    const enabled = blockers.length === 0;
+    const submenu: Electron.MenuItemConstructorOptions[] = visibleModels
+      .map((model) => ({
+        label: `${model.label}${downloaded.has(model.value) ? "" : " (not downloaded)"}`,
+        type: "radio",
+        checked: model.value === current,
+        enabled: enabled && downloaded.has(model.value),
+        click: () => this.selectWhisperModel(model.value),
+      }));
+    if (!models.some((model) => model.value === current)) {
+      submenu.unshift({ label: `${current} (unavailable)`, enabled: false });
+    }
+    submenu.push({ type: "separator" }, { label: "Manage Models…", click: this.onManageModels });
+    return {
+      label: `Whisper Model: ${models.find((model) => model.value === current)?.label || current}`,
+      submenu,
+    };
+  }
+
+  private async selectWhisperModel(modelName: string): Promise<void> {
+    try {
+      if (!this.canSwitchWhisperModel()) throw new Error("Wait until Whisper is idle before switching models.");
+      this.pluginManager.setSessionWhisperModel(modelName);
+    } catch (error) {
+      await this.notificationService.sendErrorNotification(
+        error instanceof Error ? error.message : String(error),
+      );
+    } finally {
+      await this.refreshTrayMenu();
+    }
   }
 
   /**
@@ -164,6 +259,7 @@ export class TrayService {
   }
 
   async updateTrayMenu(status: SetupStatus) {
+    const revision = ++this.menuRevision;
     if (!this.tray) return;
     const isSetupInProgress = status !== "idle";
     if (isSetupInProgress) {
@@ -177,6 +273,7 @@ export class TrayService {
     } else {
       // Generate plugin submenu asynchronously
       const pluginSubmenu = await this.generatePluginSubmenu();
+      if (revision !== this.menuRevision || !this.tray) return;
 
       // Get configured hotkey for start/stop dictation
       const hotkeySettings =
@@ -200,6 +297,9 @@ export class TrayService {
           click: () => cb(),
         });
       }
+
+      const modelMenu = this.generateWhisperModelSubmenu();
+      if (modelMenu) menuItems.push(modelMenu);
 
       menuItems.push(
         {

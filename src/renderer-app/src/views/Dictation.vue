@@ -37,8 +37,9 @@
         ></i>
       </div>
 
-      <div class="text-scroll-container" ref="textScrollContainer">
-        <div class="wave-container" :class="{ active: showVisualizer }">
+      <div class="text-scroll-container" :class="{ warming: warmupMessage }" ref="textScrollContainer">
+        <span v-if="warmupMessage" role="status" aria-live="polite" class="warmup-message">{{ warmupMessage }}</span>
+        <div v-show="!warmupMessage" class="wave-container" :class="{ active: showVisualizer }">
           <canvas
             id="waveCanvas"
             class="wave-canvas"
@@ -46,7 +47,7 @@
             ref="visualizerCanvas"
           ></canvas>
         </div>
-        <div class="text-content" ref="textContent">
+        <div v-show="!warmupMessage" class="text-content" ref="textContent">
           <template v-if="!showVisualizer">
             <template v-if="displaySegments.length > 0">
               <span
@@ -94,7 +95,10 @@
         </div>
       </div>
 
-      <button class="close-button" @click="handleClose">
+      <button v-if="warmupMessage" class="warmup-cancel-button" @click="handleClose">
+        Cancel warm-up
+      </button>
+      <button v-else class="close-button" aria-label="Cancel dictation" @click="handleClose">
         <i class="ph-duotone ph-x"></i>
       </button>
     </div>
@@ -107,4 +111,30 @@ export default dictationComponent;
 
 <style lang="less">
 @import "../styles/dictation.less";
+ .dictation-root {
+  .text-scroll-container.warming { height: 32px; }
+  .warmup-message {
+    display: block;
+    font-size: 12px;
+    line-height: 16px;
+    white-space: pre-line;
+    opacity: 0.9;
+  }
+  .warmup-cancel-button {
+    flex-shrink: 0;
+    padding: 5px 9px;
+    border: 1px solid rgba(0, 0, 0, 0.25);
+    border-radius: 6px;
+    background: linear-gradient(#fff, #e8e8ec);
+    color: #242426;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 1px 2px rgba(0, 0, 0, 0.16);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    -webkit-app-region: no-drag;
+    &:hover { background: linear-gradient(#fff, #dcdce3); }
+    &:active { box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.22); }
+    &:focus-visible { outline: 2px solid #007aff; outline-offset: 2px; }
+  }
+}
 </style>

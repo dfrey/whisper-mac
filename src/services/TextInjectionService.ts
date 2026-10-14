@@ -96,7 +96,9 @@ export class TextInjectionService {
       if (macInput?.copyToClipboard) {
         const ok = macInput.copyToClipboard(text);
         if (ok) {
-          await this.notificationService.sendClipboardNotification();
+          // Clipboard notification is informational and must not hold the
+          // dictation flow open if macOS never reports that it was shown.
+          void this.notificationService.sendClipboardNotification();
           return;
         }
       }
@@ -104,7 +106,7 @@ export class TextInjectionService {
 
     // Fallback to Electron clipboard
     clipboard.writeText(text);
-    await this.notificationService.sendClipboardNotification();
+    void this.notificationService.sendClipboardNotification();
   }
 
   async checkAccessibilityPermissions(

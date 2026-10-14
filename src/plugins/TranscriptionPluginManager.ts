@@ -13,6 +13,7 @@ import { appEventBus } from "../services/AppEventBus";
 import { promiseManager } from "../core/PromiseManager";
 import { appStore } from "../core/AppStore";
 import { AudioSpeedProcessor } from "../helpers/AudioSpeedProcessor";
+import type { WhisperCppTranscriptionPlugin } from "./WhisperCppTranscriptionPlugin";
 
 export class TranscriptionPluginManager extends EventEmitter {
   private plugins: Map<string, BaseTranscriptionPlugin> = new Map();
@@ -22,6 +23,35 @@ export class TranscriptionPluginManager extends EventEmitter {
   private bufferingOverride: boolean | null = null;
   private bufferedAudioChunks: Float32Array[] = [];
   private audioSpeedMultiplier: number = 1.0;
+  private sessionWhisperModel: string | null = null;
+
+  getSessionWhisperModel(): string | null {
+    return this.sessionWhisperModel;
+  }
+
+  setSessionWhisperModel(modelName: string): void {
+    if (appStore.select((s) =>
+      s.dictation.state !== "idle" ||
+      s.app.status !== "idle"
+    )) {
+      throw new Error("Wait until dictation and app setup finish before switching models.");
+    }
+    const plugin = this.getPlugin("whisper-cpp") as WhisperCppTranscriptionPlugin | null;
+    if (!plugin) throw new Error("Whisper.cpp is not registered");
+    if (plugin.isWarmingUp()) throw new Error("Wait for Whisper warm-up to finish before switching models.");
+    plugin.selectDownloadedModel(modelName);
+    this.rememberSessionWhisperModel();
+  }
+
+  /** Called only after a successful tray or Settings model change. No disk writes. */
+  rememberSessionWhisperModel(): void {
+    const plugin = this.getPlugin("whisper-cpp");
+    const options = plugin?.getOptions();
+    if (!options?.model) return;
+    this.config.setPluginConfig({ "whisper-cpp": { ...options } });
+    this.sessionWhisperModel = options.model;
+    this.emit("whisper-model-changed", options.model);
+  }
 
   constructor(config: AppConfig) {
     super();
@@ -72,6 +102,9 @@ export class TranscriptionPluginManager extends EventEmitter {
 
     plugin.on("downloadProgress", (progress: any) => {
       this.emit("plugin-download-progress", { plugin: plugin.name, progress });
+    });
+    plugin.on("warmup-state-changed", (warmingUp: boolean) => {
+      this.emit("plugin-warmup-changed", { plugin: plugin.name, warmingUp });
     });
 
     this.emit("plugin-registered", plugin);

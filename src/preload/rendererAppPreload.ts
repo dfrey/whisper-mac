@@ -35,6 +35,8 @@ function createSimpleListenerWithCleanup(
 }
 
 const dictationAPI = {
+  onDictationWarmupMessage: (callback: (message: string) => void) =>
+    createListenerWithCleanup("dictation-warmup-message", callback),
   onAnimateIn: (callback: () => void) => {
     return createSimpleListenerWithCleanup("animate-in", callback);
   },
@@ -278,6 +280,14 @@ const settingsAPI = {
       callback(pluginName);
     ipcRenderer.on("settings:activePluginUpdated", listener);
     return () => ipcRenderer.removeListener("settings:activePluginUpdated", listener);
+  },
+  getSessionWhisperModel: () => ipcRenderer.invoke("settings:getSessionWhisperModel"),
+  setSessionWhisperModel: (modelName: string) =>
+    ipcRenderer.invoke("settings:setSessionWhisperModel", modelName),
+  onWhisperModelUpdated: (callback: (modelName: string) => void) => {
+    const listener = (_event: IpcRendererEvent, modelName: string) => callback(modelName);
+    ipcRenderer.on("settings:whisperModelUpdated", listener);
+    return () => ipcRenderer.removeListener("settings:whisperModelUpdated", listener);
   },
   onSettingsUpdated: (callback: (settings: Record<string, any>) => void) => {
     ipcRenderer.on("settings:updated", (_event, settings) =>

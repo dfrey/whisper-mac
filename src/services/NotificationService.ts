@@ -48,6 +48,7 @@ export class NotificationService {
           message,
           sound,
           icon,
+          timeout,
         );
       } else {
         console.log("Falling back to AppleScript notifications");
@@ -135,8 +136,33 @@ export class NotificationService {
     message?: string,
     sound?: string,
     icon?: string,
+    timeout = NotificationService.TIMEOUT_MS,
   ): Promise<void> {
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+      let notification: Notification | null = null;
+
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+        notification?.removeListener("show", onShow);
+        notification?.removeListener("failed", onFailed);
+        if (error) reject(error);
+        else resolve();
+      };
+
+      const onShow = () => {
+        console.log("Native notification shown successfully");
+        finish();
+      };
+
+      const onFailed = (_event: unknown, error: string) => {
+        console.warn("Native notification failed:", error);
+        finish(new Error(`Native notification failed: ${error}`));
+      };
+
       try {
         const notificationOptions: any = {
           title,
@@ -157,17 +183,13 @@ export class NotificationService {
           console.log("Using system default notification icon");
         }
 
-        const notification = new Notification(notificationOptions);
-
-        notification.on("show", () => {
-          console.log("Native notification shown successfully");
-          resolve();
-        });
-
-        notification.on("failed", (event, error) => {
-          console.warn("Native notification failed:", error);
-          reject(new Error(`Native notification failed: ${error}`));
-        });
+        notification = new Notification(notificationOptions);
+        notification.on("show", onShow);
+        notification.on("failed", onFailed);
+        timeoutHandle = setTimeout(() => {
+          console.warn(`Native notification was not shown within ${timeout}ms`);
+          finish(new Error(`Native notification was not shown within ${timeout}ms`));
+        }, timeout);
 
         // Handle sound separately for macOS
         if (sound && process.platform === "darwin") {
@@ -178,7 +200,7 @@ export class NotificationService {
 
         notification.show();
       } catch (error) {
-        reject(error);
+        finish(error instanceof Error ? error : new Error(String(error)));
       }
     });
   }

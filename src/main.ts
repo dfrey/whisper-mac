@@ -303,6 +303,10 @@ class WhisperMacApp {
       this.trayService?.refreshTrayMenu();
       this.settingsService.broadcastActivePluginUpdate(plugin.name);
     });
+    this.transcriptionPluginManager.on("whisper-model-changed", (modelName: string) => {
+      this.trayService?.refreshTrayMenu();
+      this.settingsService.broadcastWhisperModelUpdate(modelName);
+    });
 
     this.settingsManager.on("shortcuts-resume", () => {
       console.log("Shortcuts resume requested, re-registering hotkeys...");
@@ -436,6 +440,9 @@ class WhisperMacApp {
       this.transcriptionPluginManager,
       this.notificationService,
       this.settingsManager,
+      this.modelManager,
+      () => this.unifiedModelDownloadService.isDownloading(),
+      () => this.settingsService.openSettingsWindow("transcription"),
     );
     this.trayService.createTray();
     this.trayService.setRecordingNotesCallback(() => {

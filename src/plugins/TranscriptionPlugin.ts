@@ -188,6 +188,12 @@ export abstract class BaseTranscriptionPlugin extends EventEmitter {
     return { ...this.options };
   }
 
+  async waitForWarmup(): Promise<void> {}
+
+  isWarmingUp(): boolean {
+    return false;
+  }
+
   setOptions(options: Record<string, any>): void {
     this.options = { ...options };
   }

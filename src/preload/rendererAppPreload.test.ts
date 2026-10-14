@@ -25,6 +25,13 @@ test("Settings' actual preload exposes plugin updates and listener cleanup", () 
     },
   });
 
+  const warmupMessages: string[] = [];
+  const removeWarmupListener = exposed.electronAPI.onDictationWarmupMessage((message: string) => warmupMessages.push(message));
+  ipcRenderer.emit("dictation-warmup-message", {}, "Warm-up in progress — you can speak now");
+  ipcRenderer.emit("dictation-warmup-message", {}, "");
+  expect(warmupMessages).toEqual(["Warm-up in progress — you can speak now", ""]);
+  removeWarmupListener();
+  expect(ipcRenderer.listenerCount("dictation-warmup-message")).toBe(0);
   expect(typeof exposed.electronAPI.onActivePluginUpdated).toBe("function");
   const selections: string[] = [];
   const cleanup = exposed.electronAPI.onActivePluginUpdated((name: string) => selections.push(name));
@@ -35,4 +42,12 @@ test("Settings' actual preload exposes plugin updates and listener cleanup", () 
   ipcRenderer.emit("settings:activePluginUpdated", {}, "yap");
   expect(selections).toEqual(["whisper-cpp", "parakeet"]);
   expect(ipcRenderer.listenerCount("settings:activePluginUpdated")).toBe(0);
+  expect(typeof exposed.electronAPI.getSessionWhisperModel).toBe("function");
+  expect(typeof exposed.electronAPI.setSessionWhisperModel).toBe("function");
+  const models: string[] = [];
+  const removeModelListener = exposed.electronAPI.onWhisperModelUpdated((name: string) => models.push(name));
+  ipcRenderer.emit("settings:whisperModelUpdated", {}, "ggml-small.bin");
+  expect(models).toEqual(["ggml-small.bin"]);
+  removeModelListener();
+  expect(ipcRenderer.listenerCount("settings:whisperModelUpdated")).toBe(0);
 });

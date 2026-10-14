@@ -12,6 +12,9 @@ Local first, extensible, privacy friendly and fast dictation app for macOS. It s
 - Real time transcription using [Silero VAD](https://www.vad.ricky0123.com/) to chunk audio
 - Extensible with plugins. See plugins like [the whisper plugin](src/plugins/WhisperCppTranscriptionPlugin.ts)
 - WhisperCpp with apple metal CoreML support (the fastest implementation I could find for apple's MPS)
+- Quick tray-menu switching between downloaded Whisper.cpp models. The selected model stays synchronized with Settings during the session and is saved across restarts only when Settings is saved.
+- Recurring dummy warm-ups are disabled so they cannot hang dictation startup or repeatedly lock the tray selector; Whisper loads for the actual dictation instead.
+- Transcription failures are surfaced in a resizable error window with the native Whisper error details.
 - Support for Nvidia's Parakeet STT engine, the fastest and most accurate currently
 - (Optional) enhancement of transcribed text via an OpenAI compatible service (using Cerebras as the default)
 - Configurable actions (Say "Open Safari" or "Open hackernews")

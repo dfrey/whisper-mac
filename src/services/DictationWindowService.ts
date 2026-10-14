@@ -25,6 +25,14 @@ export class DictationWindowService extends EventEmitter {
   private config: AppConfig;
   private currentSegments: Segment[] = [];
   private currentStatus: DictationStatus = "idle";
+  private warmupMessage = "";
+
+  setWarmupMessage(warmingUp: boolean, modelLabel = "Whisper"): void {
+    this.warmupMessage = warmingUp ? `Warm-up in progress: ${modelLabel}\nPlease wait` : "";
+    if (this.dictationWindow && !this.dictationWindow.isDestroyed()) {
+      this.dictationWindow.webContents.send("dictation-warmup-message", this.warmupMessage);
+    }
+  }
 
   constructor(config: AppConfig) {
     super();
@@ -49,6 +57,7 @@ export class DictationWindowService extends EventEmitter {
           selectedText: "",
           hasSelection: false,
           isRunOnAll,
+          warmupMessage: this.warmupMessage,
         });
       }
 
@@ -64,6 +73,7 @@ export class DictationWindowService extends EventEmitter {
         selectedText: "",
         hasSelection: false,
         isRunOnAll,
+        warmupMessage: this.warmupMessage,
       });
     });
 

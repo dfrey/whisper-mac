@@ -75,6 +75,8 @@ export default {
       pluginData: { plugins: [], schemas: {} },
       activePlugin: null,
       removeActivePluginListener: null,
+      removeWhisperModelListener: null,
+      whisperModelRevision: 0,
       pluginDataInfo: [],
       pluginDataItems: {},
       expandedActions: {},
@@ -216,6 +218,7 @@ export default {
         this.originalSettings = deepClone(this.settings);
         // Keep the saved baseline separate from the current session selection.
         await this.refreshSessionPlugin();
+        await this.refreshSessionWhisperModel();
         // Fetch AI capabilities of active plugin
         await this.fetchActivePluginAiCapabilities();
 
@@ -301,12 +304,19 @@ export default {
       );
 
       // Listen for settings updates from main process (e.g., when hotkeys change)
+      this.removeWhisperModelListener?.();
+      this.removeWhisperModelListener = window.electronAPI.onWhisperModelUpdated((modelName) => {
+        this.whisperModelRevision++;
+        this.applySessionWhisperModel(modelName);
+      });
+
       window.electronAPI.onSettingsUpdated(async (newSettings) => {
         // Update local settings to stay in sync with backend
         this.settings = deepClone(newSettings);
         ensurePluginSettingsObjects(this.settings, this.pluginData);
         this.originalSettings = deepClone(this.settings);
         await this.refreshSessionPlugin();
+        await this.refreshSessionWhisperModel();
         await this.fetchActivePluginAiCapabilities();
       });
     },
@@ -316,6 +326,20 @@ export default {
       this.activePlugin = pluginName || this.settings.transcriptionPlugin || "yap";
       this.settings.transcriptionPlugin = this.activePlugin;
       this.pendingPluginSwitch = false;
+    },
+
+    applySessionWhisperModel(modelName) {
+      if (!modelName) return;
+      this.settings.plugin ||= {};
+      this.settings.plugin["whisper-cpp"] ||= {};
+      this.settings.plugin["whisper-cpp"].model = modelName;
+    },
+
+    async refreshSessionWhisperModel() {
+      const revision = this.whisperModelRevision;
+      const modelName = await window.electronAPI.getSessionWhisperModel();
+      // Do not overwrite a newer tray notification with an older IPC response.
+      if (revision === this.whisperModelRevision) this.applySessionWhisperModel(modelName);
     },
 
 
@@ -570,6 +594,11 @@ export default {
     async cancelChanges() {
       const savedPlugin = this.originalSettings.transcriptionPlugin || "yap";
       try {
+        const sessionModel = await window.electronAPI.getSessionWhisperModel();
+        const savedModel = this.originalSettings.plugin?.["whisper-cpp"]?.model;
+        if (sessionModel && savedModel && sessionModel !== savedModel) {
+          await window.electronAPI.setSessionWhisperModel(savedModel);
+        }
         if ((await getActivePlugin()) !== savedPlugin) {
           await window.electronAPI.switchPlugin(savedPlugin);
         }
@@ -1142,6 +1171,7 @@ export default {
   },
   beforeUnmount() {
     this.removeActivePluginListener?.();
+    this.removeWhisperModelListener?.();
   },
 
   mounted() {

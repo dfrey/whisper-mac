@@ -4,6 +4,7 @@ import {
   existsSync,
   readFileSync,
   readdirSync,
+  statSync,
 } from "fs";
 import { join } from "path";
 import { arch, platform } from "os";
@@ -51,6 +52,40 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
   private static readonly TRANSCRIPTION_TIMEOUT_MS = 180_000;
   private static readonly WARMUP_TIMEOUT_MS = 600_000;
   private whisperProcessQueue: Promise<void> = Promise.resolve();
+  private workController = new AbortController();
+  private warmupController: AbortController | null = null;
+  private audioJobs = 0;
+  private warmupFailedModel: string | null = null;
+
+  isWarmingUp(): boolean {
+    return this.isWarmupRunning;
+  }
+
+  async waitForWarmup(): Promise<void> {
+    const modelPath = this.modelPath;
+    if (this.isWarmupRunning) {
+      await new Promise<void>((resolve) => {
+        const onState = (warmingUp: boolean) => {
+          if (!warmingUp) {
+            this.off("warmup-state-changed", onState);
+            resolve();
+          }
+        };
+        this.on("warmup-state-changed", onState);
+      });
+    }
+    if (this.warmupFailedModel === modelPath) {
+      throw new Error("Model warm-up failed. Select another model or try again.");
+    }
+  }
+
+  private cancelPendingWork(): void {
+    this.workController.abort();
+    this.warmupController?.abort();
+    this.workController = new AbortController();
+    this.audioJobs = 0;
+    this.isCurrentlyTranscribing = false;
+  }
 
   constructor(config: AppConfig) {
     super();
@@ -58,7 +93,7 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
     this.isAppleSilicon = arch() === "arm64" && platform() === "darwin";
     this.whisperBinaryPath = this.resolveWhisperBinaryPath(); // Keep for backward compatibility
     // Don't set modelPath here - wait for options to be applied
-    this.resolvedBinaryPath = this.getBinaryPath(true); // Resolve once and store
+    this.resolvedBinaryPath = this.getBinaryPath(); // Resolve once and store
 
     // Default to processing segments individually, will be updated when options are set
     const defaultRunOnAll = false;
@@ -279,6 +314,11 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
       return;
     }
 
+    const signal = this.workController.signal;
+    const sessionUid = this.sessionUid;
+    // Real speech has priority over speculative warm-up work.
+    this.warmupController?.abort();
+    this.audioJobs++;
     let tempAudioPath: string | null = null;
     try {
       this.isCurrentlyTranscribing = true;
@@ -300,10 +340,12 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
 
       // Create temporary WAV file for whisper.cpp
       tempAudioPath = await this.saveAudioAsWav(audioData);
+      signal.throwIfAborted();
 
       // Transcribe with whisper.cpp
       const rawTranscription =
-        await this.transcribeWithWhisperCpp(tempAudioPath);
+        await this.transcribeWithWhisperCpp(tempAudioPath, undefined, signal);
+      if (signal.aborted || sessionUid !== this.sessionUid) return;
 
       // Use uniform post-processing API
       const postProcessed = this.postProcessTranscription(rawTranscription, {
@@ -332,24 +374,9 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
         });
       }
     } catch (error: any) {
+      if (signal.aborted || sessionUid !== this.sessionUid) return;
       console.error("Failed to process audio segment:", error);
-
-      const errorSegment: TranscribedSegment = {
-        id: uuidv4(),
-        type: "transcribed",
-        text: "[Transcription failed]",
-        completed: true,
-        timestamp: Date.now(),
-        confidence: 0,
-      };
-
-      this.currentSegments = [errorSegment];
-      if (this.onTranscriptionCallback) {
-        this.onTranscriptionCallback({
-          segments: [...this.currentSegments],
-          sessionUid: this.sessionUid,
-        });
-      }
+      throw error;
     } finally {
       if (tempAudioPath !== null) {
         // Clean up temp file
@@ -359,11 +386,15 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
           console.warn("Failed to delete temp audio file:", err);
         }
       }
-      this.isCurrentlyTranscribing = false;
+      if (signal === this.workController.signal) {
+        this.audioJobs--;
+        this.isCurrentlyTranscribing = this.audioJobs > 0;
+      }
     }
   }
 
   async transcribeFile(filePath: string): Promise<string> {
+    this.warmupController?.abort();
     const rawTranscription = await this.transcribeWithWhisperCpp(filePath);
     const postProcessed = this.postProcessTranscription(rawTranscription, {
       parseTimestamps: true,
@@ -377,6 +408,7 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
     console.log("=== Stopping Whisper.cpp transcription plugin ===");
 
     this.setRunning(false);
+    this.cancelPendingWork();
     this.setTranscriptionCallback(null);
     this.currentSegments = [];
     this.isCurrentlyTranscribing = false;
@@ -385,7 +417,9 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
   }
 
   async cleanup(): Promise<void> {
-    await this.stopTranscription();
+    // Prevent another warm-up from being scheduled while shutdown waits for
+    // SIGTERM/SIGKILL and the child's close event.
+    await this.onDeactivate();
 
     // Clean up temp directory
     try {
@@ -457,12 +491,8 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
 
 
 
-  /**
-   * Get the appropriate binary path for the current platform
-   * @param preferMetal - Whether to prefer Metal version on Apple Silicon
-   * @returns Path to the appropriate binary
-   */
-  getBinaryPath(preferMetal = true): string {
+  /** Select the CoreML-enabled or regular Metal-capable binary from settings. */
+  getBinaryPath(): string {
     if (this.isAppleSilicon && this.useCoreML) {
       // Try production bundled Metal path first
       const packagedMetalPath = join(
@@ -486,8 +516,25 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
       }
     }
 
-    // Fall back to regular binary
-    return this.resolveWhisperBinaryPath();
+    // The regular whisper-cli build can still use Metal for GPU inference.
+    // Only the separately named whisper-cli-metal build enables CoreML and
+    // requires a matching .mlmodelc encoder. Do not let the generic resolver
+    // select that CoreML build when CoreML is disabled.
+    const packagedPath = join(
+      process.resourcesPath,
+      "whisper-cpp",
+      "whisper-cli",
+    );
+    if (existsSync(packagedPath)) {
+      return packagedPath;
+    }
+
+    const devPath = join(process.cwd(), "vendor", "whisper-cpp", "whisper-cli");
+    if (existsSync(devPath)) {
+      return devPath;
+    }
+
+    return "whisper-cli";
   }
 
   /**
@@ -515,7 +562,14 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
   /**
    * Transcribe audio file using whisper.cpp CLI
    */
-  private async transcribeWithWhisperCpp(audioPath: string, timeoutMs = WhisperCppTranscriptionPlugin.TRANSCRIPTION_TIMEOUT_MS): Promise<string> {
+  private async transcribeWithWhisperCpp(
+    audioPath: string,
+    timeoutMs = WhisperCppTranscriptionPlugin.TRANSCRIPTION_TIMEOUT_MS,
+    signal = this.workController.signal,
+  ): Promise<string> {
+  const modelPath = this.modelPath;
+  const options = { ...this.options };
+  const binaryPath = this.resolvedBinaryPath;
   // Only allow one whisper.cpp process at a time. In particular, don't let
   // a real transcription race with the Core ML warm-up/initialization.
   const previousProcess = this.whisperProcessQueue;
@@ -528,36 +582,37 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
   await previousProcess;
 
   try {
+    signal.throwIfAborted();
     return await new Promise((resolve, reject) => {
       const args = [
         "--file",
         audioPath,
         "--model",
-        this.modelPath,
+        modelPath,
         "--output-txt",
       ];
 
       // Add whisper prompt
-      const whisperPrompt = this.options.prompt;
+      const whisperPrompt = options.prompt;
       if (whisperPrompt && whisperPrompt.trim()) {
         args.push("--prompt", whisperPrompt.trim());
       }
 
       // Add configuration options
-      const language = this.options.language || "auto";
+      const language = options.language || "auto";
       args.push("--language", language);
 
 
-      const threads = this.options.threads || 4;
+      const threads = options.threads || 4;
       if (threads) {
         args.push("--threads", threads.toString());
       }
 
       console.log(
-        `Running Whisper.cpp: ${this.resolvedBinaryPath} ${args.join(" ")}`,
+        `Running Whisper.cpp: ${binaryPath} ${args.join(" ")}`,
       );
 
-      const whisperProcess = spawn(this.resolvedBinaryPath, args, {
+      const whisperProcess = spawn(binaryPath, args, {
         stdio: ["ignore", "pipe", "pipe"],
       });
 
@@ -587,16 +642,9 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
           whisperProcess.signalCode === null
         );
       }
-      const timeout = setTimeout(() => {
-        if (isChildRunning()) {
-          timedOut = true;
-
-          console.error(
-            `Whisper.cpp transcription timeout after ${timeoutSeconds} seconds`
-          );
-
+      const terminate = () => {
+        if (isChildRunning() && forceKillTimeout === null) {
           whisperProcess.kill("SIGTERM");
-
           forceKillTimeout = setTimeout(() => {
             if (isChildRunning()) {
               console.error("Whisper.cpp did not terminate after SIGTERM; sending SIGKILL");
@@ -604,10 +652,19 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
             }
           }, 5000);
         }
+      };
+      signal.addEventListener("abort", terminate, { once: true });
+      const timeout = setTimeout(() => {
+        if (isChildRunning()) {
+          timedOut = true;
+          console.error(`Whisper.cpp transcription timeout after ${timeoutSeconds} seconds`);
+          terminate();
+        }
       }, timeoutMs);
 
       const clearAll = () => {
         clearTimeout(timeout);
+        signal.removeEventListener("abort", terminate);
 
         if (forceKillTimeout !== null) {
           clearTimeout(forceKillTimeout);
@@ -615,6 +672,10 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
       };
 
       whisperProcess.on("close", (code: number | null) => {
+        if (signal.aborted) {
+          reject(signal.reason);
+          return;
+        }
         if (timedOut) {
           reject(new Error(`Whisper.cpp transcription timeout after ${timeoutSeconds} seconds`));
           return;
@@ -882,6 +943,7 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
   }
 
   async onActivated(uiFunctions?: PluginUIFunctions): Promise<void> {
+    this.cancelPendingWork();
     this.setActive(true);
 
     try {
@@ -890,7 +952,7 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
         this.options.useCoreML !== undefined
           ? this.options.useCoreML
           : this.isAppleSilicon;
-      this.resolvedBinaryPath = this.getBinaryPath(true);
+      this.resolvedBinaryPath = this.getBinaryPath();
 
       // Update activation criteria based on runOnAll option
       const runOnAll =
@@ -923,9 +985,8 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
         `Whisper.cpp plugin activated with model: ${modelName}, runOnAll: ${runOnAll}`,
       );
 
-      // Start warmup loop and run initial warmup
-      this.startWarmupLoop();
-      this.runWarmupIfIdle();
+      // Warm-up is temporarily disabled to evaluate normal per-dictation model loading.
+      // Keep the implementation available so the behavior can be restored easily.
     } catch (error) {
       this.setActive(false);
       throw error;
@@ -953,8 +1014,12 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
   }
 
   async onDeactivate(): Promise<void> {
-    await super.onDeactivate();
+    this.setActive(false);
     this.stopWarmupLoop();
+    await this.stopTranscription();
+    // Aborting requests termination; only close releases the process queue.
+    // Keep Electron alive so the five-second SIGKILL fallback can run.
+    await this.whisperProcessQueue;
   }
 
   async listData(): Promise<
@@ -1128,12 +1193,34 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
     }
   }
 
+  /** Switch only to an existing local model, without downloads or other option changes. */
+  selectDownloadedModel(modelName: string): void {
+    const models = this.getSchema().find((item) => item.key === "model")?.options || [];
+    if (!models.some((model) => model.value === modelName)) {
+      throw new Error(`Unknown Whisper model: ${modelName}`);
+    }
+    if (this.getState().isLoading || this.isCurrentlyTranscribing || this.isWarmupRunning) {
+      throw new Error("Whisper is busy. Wait until processing, warm-up, or downloading finishes.");
+    }
+    const modelPath = join(this.config.getModelsDir(), modelName);
+    const stats = existsSync(modelPath) ? statSync(modelPath) : null;
+    if (!stats?.isFile() || stats.size === 0) {
+      throw new Error(`Model ${modelName} is not downloaded. Download it in Settings first.`);
+    }
+    // Validate everything before committing either runtime value.
+    if (modelName !== this.options.model) this.cancelPendingWork();
+    this.options = { ...this.options, model: modelName };
+    this.modelPath = modelPath;
+  }
+
   async updateOptions(
     options: Record<string, any>,
     uiFunctions?: PluginUIFunctions,
   ): Promise<void> {
     // Store previous model for change detection
     const previousModel = this.options.model;
+    const previousModelPath = this.modelPath;
+    if (options.model && options.model !== previousModel) this.cancelPendingWork();
     const previousRunOnAll = this.options.runOnAll;
     this.setOptions(options);
 
@@ -1177,7 +1264,8 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
           if (coreMLPath) {
             this.useCoreML = true;
             this.options.useCoreML = true;
-            this.resolvedBinaryPath = this.getBinaryPath(true);
+            this.resolvedBinaryPath = this.getBinaryPath();
+            this.setLoadingState(false);
 
             if (uiFunctions) {
               uiFunctions.showSuccess(`Core ML model downloaded successfully`);
@@ -1205,7 +1293,8 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
           await this.deleteCoreMLModels();
           this.useCoreML = false;
           this.options.useCoreML = false;
-          this.resolvedBinaryPath = this.getBinaryPath(true);
+          this.resolvedBinaryPath = this.getBinaryPath();
+          this.setLoadingState(false);
 
           if (uiFunctions) {
             uiFunctions.showSuccess("Core ML models removed successfully");
@@ -1264,12 +1353,15 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
         }
       } catch (error) {
         const errorMsg = `Failed to switch model: ${error}`;
+        this.options.model = previousModel;
+        this.modelPath = previousModelPath;
         this.setError(errorMsg);
         this.setLoadingState(false);
         if (uiFunctions) {
           uiFunctions.showError(errorMsg);
           uiFunctions.hideProgress();
         }
+        throw new Error(errorMsg);
       }
     }
 
@@ -1303,9 +1395,15 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
     if (this.isWarmupRunning) return; // Don't start another warmup if one is already running
     if (!this.isPluginActive()) return;
     if (this.isCurrentlyTranscribing) return;
+    if (this.isRunning) return;
     if (this.isWindowVisible) return; // Don't run warmup during active dictation
+    if (this.warmupFailedModel === this.modelPath) return;
 
+    const controller = new AbortController();
+    this.warmupController = controller;
+    const modelPath = this.modelPath;
     this.isWarmupRunning = true;
+    this.emit("warmup-state-changed", true);
     let tempAudioPath: string | null = null;
     try {
       // Warmup: Running dummy audio (log removed for production)
@@ -1316,9 +1414,12 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
       tempAudioPath = await this.saveAudioAsWav(dummy);
 
       try {
-        await this.transcribeWithWhisperCpp(tempAudioPath, WhisperCppTranscriptionPlugin.WARMUP_TIMEOUT_MS);
+        await this.transcribeWithWhisperCpp(tempAudioPath, WhisperCppTranscriptionPlugin.WARMUP_TIMEOUT_MS, controller.signal);
       } catch (e) {
-        console.warn("Whisper.cpp warmup transcription failed:", e);
+        if (!controller.signal.aborted) {
+          this.warmupFailedModel = modelPath;
+          console.warn("Whisper.cpp warmup transcription failed:", e);
+        }
       }
     } catch (e) {
       console.warn("Whisper.cpp warmup failed:", e);
@@ -1332,6 +1433,8 @@ export class WhisperCppTranscriptionPlugin extends BaseTranscriptionPlugin {
         }
       }
       this.isWarmupRunning = false;
+      this.warmupController = null;
+      this.emit("warmup-state-changed", false);
     }
   }
 
